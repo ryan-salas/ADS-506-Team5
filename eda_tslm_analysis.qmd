@@ -1,0 +1,193 @@
+---
+title: "Discussion 3.1"
+author: "Christopher Guillen"
+format: html
+editor: visual
+---
+
+```{r}
+#| message: false
+#| warning: false
+library(tidyverse)
+library(fpp3)
+```
+
+## Dataset
+
+For my portion of our final project, I used the monthly U.S. retail and food-service sales series from FRED (MRTSSM44X72USN), reported by the U.S. Census Bureau in millions of dollars and not seasonally adjusted. The training data covers January 1992 through August 2025, and the testing data covers September 2025 through August 2026, the same split my teammate used for the ARIMA models, so our results are directly comparable. I compared a manually specified TSLM model with an automatically selected TSLM model.
+
+## Train/Test Split
+
+```{r}
+# read the FRED series directly (same source and cutoff as the ARIMA analysis)
+url <- "https://fred.stlouisfed.org/graph/fredgraph.csv?id=MRTSSM44X72USN"
+raw <- read_csv(url, show_col_types = FALSE)
+names(raw)[1:2] <- c("DATE", "Sales")
+
+retail <- raw |>
+  mutate(DATE = as.Date(DATE), Month = yearmonth(DATE),
+         Sales = parse_number(as.character(Sales))) |>
+  select(Month, Sales) |>
+  filter(Month <= yearmonth("2026 Aug")) |>
+  filter(!is.na(Sales)) |>
+  as_tsibble(index = Month)
+
+# hold out the final 12 months for testing (same split as the ARIMA analysis)
+test_start <- max(retail$Month) - 11
+training <- retail |> filter(Month < test_start)
+testing <- retail |> filter(Month >= test_start)
+
+training |> autoplot(Sales)
+```
+
+## Manual and Auto-Selected TSLM Models
+
+```{r}
+# auto: let AICc choose the number of Fourier terms (K = 1 to 6)
+fourier_search <- training |>
+  model(
+    K1 = TSLM(Sales ~ trend() + fourier(K = 1)),
+    K2 = TSLM(Sales ~ trend() + fourier(K = 2)),
+    K3 = TSLM(Sales ~ trend() + fourier(K = 3)),
+    K4 = TSLM(Sales ~ trend() + fourier(K = 4)),
+    K5 = TSLM(Sales ~ trend() + fourier(K = 5)),
+    K6 = TSLM(Sales ~ trend() + fourier(K = 6))
+  )
+
+fourier_search |>
+  glance() |>
+  select(.model, adj_r_squared, AICc) |>
+  arrange(AICc)
+```
+
+```{r}
+# fit manual and auto TSLM models
+# (set K in Auto_TSLM to the lowest-AICc value from the search above)
+tslm_fits <- training |>
+  model(
+    Manual_TSLM = TSLM(log(Sales) ~ trend() + season()),
+    Auto_TSLM = TSLM(Sales ~ trend() + fourier(K = 6))
+  )
+
+# output the model information
+tslm_fits |> select(Manual_TSLM) |> report()
+tslm_fits |> select(Auto_TSLM) |> report()
+```
+
+**Reasoning for manual model hyperparameters:**
+
+Because TSLM has no built-in automatic selection, I created the auto model by fitting Fourier terms from K = 1 to 6, each with a linear trend, and keeping the one with the lowest AICc. For my manual model, I regressed log(Sales) on a linear trend and monthly seasonal dummies. The training plot shows that the seasonal swings, especially the December peaks, grow as sales increase, and the long-term growth looks closer to exponential than linear. Taking the log turns that multiplicative pattern into an additive one that a linear regression can model, and the forecasts are automatically converted back to the original dollar scale.
+
+## Forecast Plots
+
+```{r}
+# forecast the testing period
+tslm_fc <- tslm_fits |> forecast(new_data = testing)
+
+plot_data <- retail |> filter_index("2021 Jan" ~ .)
+
+# plot the manual model
+tslm_fc |>
+  filter(.model == "Manual_TSLM") |>
+  autoplot(plot_data, level = c(80, 95)) +
+  labs(title = "Manual TSLM (log Sales) Forecast vs. Actual Sales",
+       subtitle = "Last 12 months held out for testing",
+       y = "Sales (millions of US dollars)") +
+  scale_y_continuous(labels = scales::comma)
+
+# plot the auto model
+tslm_fc |>
+  filter(.model == "Auto_TSLM") |>
+  autoplot(plot_data, level = c(80, 95)) +
+  labs(title = "Auto TSLM (Fourier) Forecast vs. Actual Sales",
+       subtitle = "Last 12 months held out for testing",
+       y = "Sales (millions of US dollars)") +
+  scale_y_continuous(labels = scales::comma)
+```
+
+## Model Comparison
+
+```{r}
+# compare accuracy on the testing period
+tslm_fc |>
+  accuracy(retail) |>
+  select(.model, RMSE, MAE, MAPE, MASE, RMSSE) |>
+  arrange(RMSE)
+```
+
+```{r}
+# best Box-Cox lambda for the training series
+training |> features(Sales, features = guerrero)
+
+# residual diagnostics for the Week 3 model
+fit_log <- training |>
+  model(Manual_TSLM = TSLM(log(Sales) ~ trend() + season()))
+
+fit_log |> gg_tsresiduals()
+```
+
+```{r}
+#| warning: false
+# rolling origin: start with 20 years of data, add 1 year per fold
+retail_cv <- retail |>
+  stretch_tsibble(.init = 240, .step = 12)
+
+cv_fc <- retail_cv |>
+  model(Manual_TSLM = TSLM(log(Sales) ~ trend() + season())) |>
+  forecast(h = 12)
+
+# overall cross-validated accuracy
+cv_fc |> accuracy(retail) |> select(.model, RMSE, MAE, MAPE)
+
+# accuracy for each fold
+fold_start <- cv_fc |>
+  as_tibble() |>
+  group_by(.id) |>
+  summarise(Start = min(Month))
+
+cv_by_fold <- cv_fc |>
+  accuracy(retail, by = c(".model", ".id")) |>
+  left_join(fold_start, by = ".id")
+
+cv_by_fold |>
+  ggplot(aes(x = Start, y = MAPE)) +
+  geom_line() +
+  geom_point() +
+  labs(title = "Rolling-Origin CV: 12-Month Forecast Error by Year",
+       x = "Forecast start", y = "MAPE (%)")
+```
+
+```{r}
+# zero/negative check (should be FALSE)
+any(retail$Sales <= 0)
+
+# Figure 1: full time series
+retail |>
+  autoplot(Sales) +
+  labs(title = "U.S. Monthly Retail and Food-Service Sales, 1992–2026",
+       y = "Sales (millions of US dollars)") +
+  scale_y_continuous(labels = scales::comma)
+
+# Figure 2: seasonal plot
+retail |>
+  gg_season(Sales, labels = "right") +
+  labs(title = "Seasonal Pattern by Year",
+       y = "Sales (millions of US dollars)") +
+  scale_y_continuous(labels = scales::comma)
+
+# Figure 3: STL decomposition
+retail |>
+  model(STL(Sales)) |>
+  components() |>
+  autoplot() +
+  labs(title = "STL Decomposition of Retail Sales")
+
+# differencing checks
+retail |> features(Sales, unitroot_nsdiffs)
+retail |> features(difference(Sales, 12), unitroot_ndiffs)
+```
+
+```{r}
+training |> features(Sales, unitroot_nsdiffs)
+training |> features(difference(Sales, 12), unitroot_ndiffs)
+```
