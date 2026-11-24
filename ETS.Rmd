@@ -1,0 +1,155 @@
+---
+title: "ADS506_Retail Sales_ETS"
+author: "Imogen Ronde"
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(fpp3)      
+```
+
+## Data
+
+```{r}
+url <- "https://fred.stlouisfed.org/graph/fredgraph.csv?id=MRTSSM44X72USN"
+raw <- read_csv(url, show_col_types = FALSE)
+names(raw)[1:2] <- c("DATE", "Sales")
+
+retail <- raw |>
+  mutate(DATE = as.Date(DATE), Month = yearmonth(DATE),
+         Sales = parse_number(as.character(Sales))) |>
+  select(Month, Sales) |>
+  filter(Month <= yearmonth("2026 Aug")) |>
+  filter(!is.na(Sales)) |>
+  as_tsibble(index = Month)
+
+# hold out the final 12 months for testing (same split as the ARIMA analysis)
+test_start <- max(retail$Month) - 11
+training <- retail |> filter(Month < test_start)
+testing <- retail |> filter(Month >= test_start)
+
+training |> autoplot(Sales)
+```
+
+```{r}
+tibble(set    = c("Training", "Testing"),
+       start  = c(format(min(training$Month)), format(min(testing$Month))),
+       end    = c(format(max(training$Month)), format(max(testing$Month))),
+       months = c(nrow(training), nrow(testing)))
+```
+
+## ETS
+
+### Manual model: Feature selection
+
+```{r}
+training |>
+  features(Sales, feat_stl) |>
+  select(trend_strength, seasonal_strength_year)
+
+training |>
+  model(STL(Sales ~ season(window = "periodic"))) |>
+  components() |>
+  autoplot() +
+  labs(title = "STL decomposition")
+```
+
+```{r}
+training |>
+  gg_season(Sales) +
+ +
+  labs(title = "Seasonal plot", y = "Dollars (in millions)")
+
+swing <- training |>
+  as_tibble() |>
+  mutate(Year = year(Month)) |>
+  group_by(Year) |>
+  filter(n() == 12) |>                     
+  summarise(range_dollars = max(Sales) - min(Sales),
+            range_percent = (max(Sales) - min(Sales)) / mean(Sales) * 100)
+
+swing |>
+  pivot_longer(-Year, names_to = "measure") |>
+  ggplot(aes(Year, value)) +
+  geom_line() +
+  facet_wrap(~ measure, scales = "free_y", ncol = 1,
+             labeller = as_labeller(c(range_dollars = "Dollars (in millions)",
+                                      range_percent = "Percent of yearly mean"))) +
+  labs(title = "Seasonal Swing", y = NULL)
+
+```
+
+**Manual model: ETS(M, A, M)**, the multiplicative Holt-Winters method.
+
+- **Season = M.** Seasonal strength is 0.897, so a seasonal component is needed. In dollars, the swing grew about 2.5 times over the training period. As a percent of sales it stayed far more stable (3.2), and seasonal strength rises on the log scale (3.1). The percent swing does drift down slowly, so the evidence is strong but not perfect. That makes additive seasonality (MAA) a real alternative to test in 3.4. A gamma above zero lets the seasonal pattern shift over time to follow that drift.
+- **Trend = A (not damped).** Trend strength is 0.997: sales have grown steadily for the whole history, apart from brief recessions. Over a 12-month horizon there is no reason to expect that growth to slow, so damping the trend is not justified.
+- **Error = M.** If the seasonal pattern scales with the level of sales, the random month-to-month noise probably does too. A \$5B surprise means much more in 1995 than in 2025. Multiplicative error also makes the prediction intervals widen as the level rises, which fits this series.
+- **No transformation.** Multiplicative error and seasonality already handle the growing variance, so there's no need to take logs.
+
+```{r}
+manual_candidates <- training |>
+  model(
+    MAM_chosen   = ETS(Sales ~ error("M") + trend("A")  + season("M")),
+    MAdM_damped  = ETS(Sales ~ error("M") + trend("Ad") + season("M")),
+    AAM_addError = ETS(Sales ~ error("A") + trend("A")  + season("M")),
+    MAA_addSeas  = ETS(Sales ~ error("M") + trend("A")  + season("A"))
+  )
+
+glance(manual_candidates) |> arrange(AICc) |> select(.model, AICc, BIC)
+```
+
+**Findings.** The hand-picked **ETS(M,A,M) has the lowest AICc (9786.6)**, so every one-component change makes the model worse.
+
+### Auto-selected model
+
+```{r}
+fits <- training |>
+  model(
+    Manual = ETS(Sales ~ error("M") + trend("A") + season("M")),
+    Auto   = ETS(Sales)
+  )
+
+fits |> select(Manual) |> report()
+fits |> select(Auto)   |> report()
+```
+
+```{r}
+glance(fits) |> select(.model, sigma2, log_lik, AICc, BIC)
+```
+
+```{r}
+fits |> components() |> autoplot() +
+  labs(title = "ETS components: level, slope, season")
+```
+
+```{r}
+fits |> select(Manual) |> gg_tsresiduals(lag_max = 36) + labs(title = "Manual ETS residuals")
+fits |> select(Auto)   |> gg_tsresiduals(lag_max = 36) + labs(title = "Auto ETS residuals")
+```
+
+```{r}
+fits |>
+  augment() |>
+  left_join(
+    tidy(fits) |>
+      filter(term %in% c("alpha", "beta", "gamma", "phi")) |>
+      count(.model, name = "dof"),
+    by = ".model") |>
+  group_by(.model) |>
+  summarise(lb = list(ljung_box(.innov, lag = 24, dof = first(dof)))) |>
+  unnest_wider(lb)
+```
+
+```{r}
+fc <- fits |> forecast(h = nrow(testing))
+
+fc |>
+  autoplot(bind_rows(training |> filter(Month >= yearmonth("2019 Jan")), testing),
+           level = 95, alpha = 0.5)
+  labs(title = "12-month forecast vs. actual sales",
+       y = "Dollars (in millions)", x = NULL)
+
+accuracy(fc, retail) |>
+  select(.model, RMSE, MAE, MAPE, MASE) |>
+  arrange(RMSE)
+```
